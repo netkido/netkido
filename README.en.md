@@ -61,7 +61,7 @@ and we'll upgrade your account without reinstalling anything.
 - **All traffic between the sites and the hub runs inside WireGuard**, BGP sessions included
   (between tunnel IPs in 100.64.0.0/16); the BGP TCP MD5 password is an extra layer.
 
-More detail in the [wiki](https://github.com/netkido/netkido/wiki/Arquitectura) (in Spanish).
+More detail in the [wiki](https://github.com/netkido/netkido/wiki/Architecture).
 
 ## Requirements
 
@@ -69,7 +69,7 @@ More detail in the [wiki](https://github.com/netkido/netkido/wiki/Arquitectura) 
   80/TCP, 443/TCP and 51820/UDP open.
 - **Sites:** a Linux box acting as the router of its LAN (mini PC or SBC, ideally with two network
   ports): Debian 12/13, Ubuntu 22.04/24.04, Armbian or 64-bit Raspberry Pi OS. See the
-  [tested hardware](https://github.com/netkido/netkido/wiki/Equipos-probados).
+  [tested hardware](https://github.com/netkido/netkido/wiki/Tested-hardware).
 
 ## Installation
 
@@ -98,6 +98,9 @@ site's machine (`?lang=en` gives you English messages):
 curl -fsSL "https://vpn.example.com/install/<link>?lang=en" | sudo bash
 ```
 
+Full guide: [Server installation](https://github.com/netkido/netkido/wiki/Server-installation) and
+[Adding sites](https://github.com/netkido/netkido/wiki/Adding-sites).
+
 ## Usage
 
 | To… | |
@@ -109,8 +112,9 @@ curl -fsSL "https://vpn.example.com/install/<link>?lang=en" | sudo bash
 | Take a site off the network | `sudo netkido site disable <site>` · `enable` · `remove` |
 | Logs | server: `journalctl -u netkido` · site: `journalctl -u netkido-agent` |
 
-Changes reach the sites in under a minute. `netkido --help` and `netkido site --help` list every
-command.
+Changes reach the sites in under a minute. Every command is in the
+[netkido command](https://github.com/netkido/netkido/wiki/Netkido-command) reference; if something
+goes wrong, see [Troubleshooting](https://github.com/netkido/netkido/wiki/Troubleshooting).
 
 ## Using it for your company or your clients?
 
