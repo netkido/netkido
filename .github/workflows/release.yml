@@ -1,0 +1,29 @@
+name: Release
+
+# Al publicar una etiqueta vX.Y.Z: paquete .tar.gz con su SHA-256, adjunto a la versión de GitHub.
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pruebas
+        run: python3 -m unittest discover -s tests -v
+      - name: Paquete
+        run: |
+          name="netkido-${GITHUB_REF_NAME#v}"
+          git archive --format=tar.gz --prefix="$name/" -o "$name.tar.gz" "$GITHUB_REF_NAME"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+      - name: Versión en GitHub
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          name="netkido-${GITHUB_REF_NAME#v}"
+          gh release create "$GITHUB_REF_NAME" "$name.tar.gz" "$name.tar.gz.sha256" \
+            --title "Netkido ${GITHUB_REF_NAME}" --generate-notes

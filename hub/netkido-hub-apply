@@ -1,0 +1,540 @@
+#!/usr/bin/env python3
+"""
+netkido-hub-apply — aplica en el hub el estado deseado que calcula el portal.
+
+Lee un JSON por la entrada estándar (o --from FICHERO, o --restore para el
+último aplicado), lo valida de forma estricta y genera a partir de él:
+
+  * WireGuard  /etc/wireguard/wg0.conf + `wg syncconf` (sin cortar túneles)
+  * FRR        /etc/frr/frr.conf + frr-reload.py (sin reiniciar sesiones ajenas)
+  * nftables   tabla inet netkido_iso (aislamiento entre tenants)
+
+El portal no escribe nunca ficheros de configuración: solo entrega datos, y
+este programa (que se ejecuta como root vía sudo) decide qué se escribe.
+Cualquier valor que no encaje en el esquema hace que no se aplique nada.
+
+Configuración local: /etc/netkido/hub.conf (CLAVE=valor). Ver DEFAULTS.
+"""
+import argparse
+import base64
+import fcntl
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+VERSION = "1.5.0"
+
+DEFAULTS = {
+    "CONF_FILE": "/etc/netkido/hub.conf",
+    "STATE_DIR": "/var/lib/netkido-hub",
+    "WG_PRIVATE_KEY_FILE": "/etc/netkido/wg0.key",
+    "WG_LISTEN_PORT": "53",
+    "WG_MTU": "1420",
+    "WG_CONF": "/etc/wireguard/wg0.conf",
+    "FRR_CONF": "/etc/frr/frr.conf",
+    "FRR_EXTRA": "/etc/netkido/frr-extra.conf",   # opcional: se añade tal cual al final
+    "FRR_RELOAD": "/usr/lib/frr/frr-reload.py",
+    "VTYSH": "vtysh",
+    "VTY_SOCKET": "",                             # solo para laboratorio
+    "WG": "wg",
+    "NFT": "nft",
+    "IP": "ip",
+    "LOCK_FILE": "/run/netkido-hub-apply.lock",
+    "SKIP": "",                                   # pasos que no se aplican, p. ej. "wg" (laboratorio)
+}
+
+MAX_INPUT = 8 * 1024 * 1024
+RE_NODE_ID = re.compile(r"^[0-9a-z]{26}$")
+RE_PASSWORD = re.compile(r"^[A-Za-z0-9]{16,80}$")
+RE_IFACE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]{0,14}$")
+
+
+class Invalid(Exception):
+    pass
+
+
+def log(msg):
+    print(f"[netkido-hub] {msg}", flush=True)
+
+
+def load_settings(conf_file):
+    s = dict(DEFAULTS)
+    path = os.environ.get("NETKIDO_HUB_CONF", conf_file)
+    if os.path.exists(path):
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k, v = k.strip(), v.strip().strip('"').strip("'")
+                if k in s:
+                    s[k] = v
+    s["CONF_FILE"] = path
+    return s
+
+
+# ─── Validación ──────────────────────────────────────────────────────────────
+
+def is_wg_key(k):
+    if not isinstance(k, str) or len(k) != 44 or not k.endswith("="):
+        return False
+    try:
+        return len(base64.b64decode(k, validate=True)) == 32
+    except Exception:
+        return False
+
+
+def validate(state):
+    if not isinstance(state, dict) or state.get("schema") != 1:
+        raise Invalid("schema desconocido")
+    hub = state.get("hub")
+    if not isinstance(hub, dict):
+        raise Invalid("falta hub")
+    iface = hub.get("interface")
+    if not isinstance(iface, str) or not RE_IFACE.match(iface):
+        raise Invalid("hub.interface no válido")
+    try:
+        underlay = ipaddress.IPv4Network(hub.get("underlay"), strict=True)
+        hub_ip = ipaddress.IPv4Address(hub.get("ip"))
+    except Exception:
+        raise Invalid("hub.ip / hub.underlay no válidos")
+    if hub_ip not in underlay or not (8 <= underlay.prefixlen <= 24):
+        raise Invalid("hub.ip fuera del underlay o prefijo no admitido")
+    asn = hub.get("asn")
+    if not isinstance(asn, int) or not (1 <= asn <= 4294967294):
+        raise Invalid("hub.asn no válido")
+
+    tenants = state.get("tenants")
+    if not isinstance(tenants, list):
+        raise Invalid("tenants no es una lista")
+    seen_net, seen_ip, seen_key, seen_id = set(), set(), set(), set()
+    out = []
+    for t in tenants:
+        if not isinstance(t, dict):
+            raise Invalid("tenant no válido")
+        net_id = t.get("net_id")
+        if not isinstance(net_id, int) or isinstance(net_id, bool) or not (1 <= net_id <= 3999):
+            raise Invalid(f"net_id no válido: {net_id!r}")
+        if net_id in seen_net:
+            raise Invalid(f"net_id repetido: {net_id}")
+        seen_net.add(net_id)
+        pw = t.get("bgp_password")
+        if not isinstance(pw, str) or not RE_PASSWORD.match(pw):
+            raise Invalid(f"bgp_password no válida en el tenant {net_id}")
+        nodes = t.get("nodes")
+        if not isinstance(nodes, list) or not nodes:
+            raise Invalid(f"el tenant {net_id} no tiene sedes")
+        clean_nodes = []
+        for n in nodes:
+            if not isinstance(n, dict):
+                raise Invalid("sede no válida")
+            nid = n.get("id")
+            if not isinstance(nid, str) or not RE_NODE_ID.match(nid) or nid in seen_id:
+                raise Invalid(f"id de sede no válido o repetido: {nid!r}")
+            seen_id.add(nid)
+            try:
+                ip = ipaddress.IPv4Address(n.get("wg_ip"))
+            except Exception:
+                raise Invalid(f"wg_ip no válida en {nid}")
+            if ip not in underlay or ip in (hub_ip, underlay.network_address, underlay.broadcast_address):
+                raise Invalid(f"wg_ip {ip} fuera del underlay o reservada")
+            if ip in seen_ip:
+                raise Invalid(f"wg_ip repetida: {ip}")
+            seen_ip.add(ip)
+            key = n.get("wg_pubkey")
+            if not is_wg_key(key) or key in seen_key:
+                raise Invalid(f"clave WireGuard no válida o repetida en {nid}")
+            seen_key.add(key)
+            # LAN de la sede: lo único que puede anunciar (si falta, no se le acepta ninguna ruta).
+            lan = n.get("lan")
+            if lan is not None:
+                try:
+                    lan_net = ipaddress.IPv4Network(lan, strict=True)
+                except Exception:
+                    raise Invalid(f"lan no válida en {nid}")
+                if not lan_net.is_private or not (16 <= lan_net.prefixlen <= 30) or lan_net.overlaps(underlay):
+                    raise Invalid(f"lan {lan_net} no admitida en {nid}")
+                for other in clean_nodes:
+                    if other["lan"] and lan_net.overlaps(ipaddress.IPv4Network(other["lan"])):
+                        raise Invalid(f"lan {lan_net} se solapa con otra sede del tenant {net_id}")
+                lan = str(lan_net)
+            # Contraseña TCP MD5 en su sesión BGP: solo si el kernel de la sede la admite (por defecto, sí).
+            md5 = n.get("bgp_md5", True)
+            if not isinstance(md5, bool):
+                raise Invalid(f"bgp_md5 no válido en {nid}")
+            clean_nodes.append({"id": nid, "wg_ip": str(ip), "wg_pubkey": key, "lan": lan, "bgp_md5": md5})
+        out.append({"net_id": net_id, "bgp_password": pw, "nodes": clean_nodes})
+
+
+    return {
+        "hub": {"interface": iface, "ip": str(hub_ip), "underlay": str(underlay), "asn": asn},
+        "tenants": sorted(out, key=lambda t: t["net_id"]),
+    }
+
+
+# ─── Utilidades ──────────────────────────────────────────────────────────────
+
+def run(cmd, check=True, input_text=None):
+    p = subprocess.run(cmd, input=input_text, capture_output=True, text=True)
+    if check and p.returncode != 0:
+        raise RuntimeError(f"{' '.join(cmd)} → {p.returncode}: {(p.stderr or p.stdout).strip()[:2000]}")
+    return p
+
+
+def atomic_write(path, content, mode=0o600, owner=None):
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".nk-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        if owner:
+            try:
+                shutil.chown(tmp, *owner)
+            except (LookupError, PermissionError):
+                pass
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def all_nodes(state):
+    for t in state["tenants"]:
+        for n in t["nodes"]:
+            yield t, n
+
+
+# ─── WireGuard ───────────────────────────────────────────────────────────────
+
+def render_wg(state, s, private_key, quick):
+    hub = state["hub"]
+    prefix = ipaddress.IPv4Network(hub["underlay"]).prefixlen
+    lines = ["# Generado por netkido-hub-apply — NO editar (se sobrescribe)", "[Interface]"]
+    if quick:
+        lines += [f"Address = {hub['ip']}/{prefix}", f"MTU = {int(s['WG_MTU'])}", "Table = off"]
+    lines += [f"ListenPort = {int(s['WG_LISTEN_PORT'])}", f"PrivateKey = {private_key}", ""]
+    for t, n in all_nodes(state):
+        lines += [f"# sede {n['id']} · tenant {t['net_id']}", "[Peer]",
+                  f"PublicKey = {n['wg_pubkey']}", f"AllowedIPs = {n['wg_ip']}/32", ""]
+    return "\n".join(lines)
+
+
+def apply_wg(state, s):
+    with open(s["WG_PRIVATE_KEY_FILE"]) as f:
+        private_key = f.read().strip()
+    if not is_wg_key(private_key):
+        raise RuntimeError(f"clave privada no válida en {s['WG_PRIVATE_KEY_FILE']}")
+    iface = state["hub"]["interface"]
+    atomic_write(s["WG_CONF"], render_wg(state, s, private_key, quick=True), 0o600)
+    fd, tmp = tempfile.mkstemp(prefix="nk-wg-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(render_wg(state, s, private_key, quick=False))
+        run([s["WG"], "syncconf", iface, tmp])
+    finally:
+        os.unlink(tmp)
+    peers = sum(1 for _ in all_nodes(state))
+    return f"WireGuard: {peers} peers en {iface}"
+
+
+# ─── nftables (aislamiento) ──────────────────────────────────────────────────
+
+def render_nft(state, s=None):
+    iface = state["hub"]["interface"]
+    pairs = [(n["wg_ip"], t["net_id"]) for t, n in all_nodes(state)]
+    m = ", ".join(f"{ip} : {nid}" for ip, nid in pairs)
+    ips = ", ".join(ip for ip, _ in pairs)
+    members = ", ".join(f"{nid} . {ip}" for ip, nid in pairs)
+    el = lambda x: f"\n    elements = {{ {x} }}" if x else ""
+    return f"""# Generado por netkido-hub-apply — aislamiento entre tenants
+table inet netkido_iso
+delete table inet netkido_iso
+table inet netkido_iso {{
+  map ip2tenant {{
+    type ipv4_addr : mark{el(m)}
+  }}
+  set spoke_ips {{
+    type ipv4_addr{el(ips)}
+  }}
+  set members {{
+    type mark . ipv4_addr{el(members)}
+  }}
+  chain forward {{
+    type filter hook forward priority -10; policy accept;
+    iifname "{iface}" oifname "{iface}" jump spoke_to_spoke
+    # Las sedes no salen por el hub a Internet ni a otras redes, y nada de fuera
+    # del túnel se reenvía hacia ellas.
+    iifname "{iface}" counter drop comment "netkido: wg0 hacia otras interfaces"
+    oifname "{iface}" counter drop comment "netkido: otras interfaces hacia wg0"
+  }}
+  chain input {{
+    type filter hook input priority -10; policy accept;
+    iifname "{iface}" jump from_spokes
+  }}
+  chain output {{
+    type filter hook output priority -10; policy accept;
+  }}
+  chain from_spokes {{
+    ct state established,related accept
+    icmp type {{ echo-request, echo-reply, destination-unreachable, time-exceeded }} accept
+    ip saddr @spoke_ips tcp dport 179 accept comment "BGP de sedes registradas"
+    counter drop comment "netkido: servicios del hub no expuestos al túnel"
+  }}
+  chain spoke_to_spoke {{
+    meta mark set ip saddr map @ip2tenant
+    meta mark . ip daddr @members meta mark set 0 accept
+    meta mark set 0
+    counter drop comment "netkido: tráfico entre tenants distintos o sede no registrada"
+  }}
+}}
+"""
+
+
+def apply_nft(state, s):
+    content = render_nft(state, s)
+    path = os.path.join(s["STATE_DIR"], "isolation.nft")
+    atomic_write(path, content, 0o644)
+    # Si una sede no está en el mapa, "ip saddr map" no encuentra la clave y la
+    # regla no casa: el paquete cae en el drop final (falla cerrado).
+    run([s["NFT"], "-c", "-f", path])
+    run([s["NFT"], "-f", path])
+    return f"nftables: {sum(1 for _ in all_nodes(state))} sedes en inet netkido_iso"
+
+
+
+# ─── FRR ─────────────────────────────────────────────────────────────────────
+
+def site_tag(node):
+    """Nombre corto y estable de la sede en FRR: S<3.er octeto>-<4.º octeto> de su IP de túnel."""
+    o = node["wg_ip"].split(".")
+    return f"S{o[2]}-{o[3]}"
+
+
+def render_frr(state, s):
+    hub = state["hub"]
+    asn = hub["asn"]
+    L = ["! Generado por netkido-hub-apply — NO editar (se sobrescribe)",
+         "frr defaults traditional", "hostname netkido-hub", "log syslog informational",
+         "service integrated-vtysh-config", "!"]
+    for t in state["tenants"]:
+        n = t["net_id"]
+        rt = f"{asn}:{100000 + n}"     # RT automático del L3VNI del tenant (AS:VNI)
+        L += [
+            f"bgp extcommunity-list standard EC-T{n} seq 5 permit rt {rt}",
+            f"bgp community-list standard CL-T{n} seq 5 permit {asn}:{n}",
+        ]
+        # Entrada, por sede: solo rutas de prefijo (EVPN tipo 5) con el RT de su tenant y dentro
+        # de su propia LAN. Así una sede comprometida no puede anunciar la LAN de otra sede de su
+        # organización (ni nada más) y desviar su tráfico. La community la pone el hub (sustituye
+        # la que mande la sede, no se puede falsificar).
+        for node in t["nodes"]:
+            tag = site_tag(node)
+            if node["lan"]:
+                L += [f"ip prefix-list PL-{tag} seq 5 permit {node['lan']} le 32",
+                      f"route-map RM-{tag}-IN permit 10",
+                      " match evpn route-type prefix",
+                      f" match extcommunity EC-T{n}",
+                      f" match ip address prefix-list PL-{tag}",
+                      f" set community {asn}:{n}",
+                      "exit"]
+            L += [f"route-map RM-{tag}-IN deny 20", "exit"]
+        L += [
+            # Salida: a cada tenant solo le llega lo que entró por sus sedes.
+            f"route-map RM-T{n}-OUT permit 10",
+            f" match community CL-T{n}",
+            "exit",
+            f"route-map RM-T{n}-OUT deny 20",
+            "exit",
+            "!",
+        ]
+    L += [f"router bgp {asn}",
+          f" bgp router-id {hub['ip']}",
+          f" bgp cluster-id {hub['ip']}",
+          " bgp log-neighbor-changes",
+          " no bgp default ipv4-unicast",
+          " no bgp ebgp-requires-policy"]
+    for t in state["tenants"]:
+        n = t["net_id"]
+        L += [f" neighbor T{n} peer-group",
+              f" neighbor T{n} remote-as {asn}",
+              f" neighbor T{n} timers 10 30"]
+        for node in t["nodes"]:
+            L.append(f" neighbor {node['wg_ip']} peer-group T{n}")
+            # La contraseña va por sede, no en el grupo: hay kernels de sede sin TCP MD5 (la sesión
+            # sigue dentro de WireGuard, que autentica la sede por su clave).
+            if node.get("bgp_md5", True):
+                L.append(f" neighbor {node['wg_ip']} password {t['bgp_password']}")
+    L.append(" !")
+    L.append(" address-family l2vpn evpn")
+    for t in state["tenants"]:
+        n = t["net_id"]
+        L += [f"  neighbor T{n} activate",
+              f"  neighbor T{n} route-reflector-client",
+              f"  neighbor T{n} route-map RM-T{n}-OUT out"]
+        L += [f"  neighbor {node['wg_ip']} route-map RM-{site_tag(node)}-IN in" for node in t["nodes"]]
+    L += [" exit-address-family", "exit", "!"]
+    if os.path.exists(s["FRR_EXTRA"]):
+        with open(s["FRR_EXTRA"]) as f:
+            L += [f.read().rstrip(), "!"]
+    L.append("line vty")
+    L.append("exit")
+    return "\n".join(L) + "\n"
+
+
+def vty_args(s):
+    return ["--vty_socket", s["VTY_SOCKET"]] if s["VTY_SOCKET"] else []
+
+
+def apply_frr(state, s):
+    content = render_frr(state, s)
+    conf = s["FRR_CONF"]
+    fd, tmp = tempfile.mkstemp(prefix="nk-frr-", suffix=".conf")
+    with os.fdopen(fd, "w") as f:
+        f.write(content)
+    try:
+        run([s["VTYSH"], *vty_args(s), "--dryrun", "-f", tmp])
+    except RuntimeError:
+        os.unlink(tmp)
+        raise
+    os.unlink(tmp)
+    try:
+        old = open(conf).read()
+    except OSError:
+        old = None
+    # Aunque el fichero no cambie se recarga: frr-reload solo aplica diferencias,
+    # así que corrige cualquier cambio manual hecho con vtysh.
+    if old is not None and old != content:
+        atomic_write(conf + ".prev", old, 0o640, owner=("frr", "frr"))
+    atomic_write(conf, content, 0o640, owner=("frr", "frr"))
+    reload_cmd = [sys.executable, s["FRR_RELOAD"], "--reload", conf]
+    if s["VTY_SOCKET"]:
+        reload_cmd[2:2] = ["--vty_socket", s["VTY_SOCKET"], "--bindir", os.path.dirname(shutil.which(s["VTYSH"]) or s["VTYSH"])]
+    p = run(reload_cmd, check=False)
+    if p.returncode != 0:
+        if old is not None:
+            atomic_write(conf, old, 0o640, owner=("frr", "frr"))
+            run(reload_cmd, check=False)
+        raise RuntimeError(f"frr-reload falló (se restauró la configuración anterior): {(p.stderr or p.stdout).strip()[-2000:]}")
+    peers = sum(1 for _ in all_nodes(state))
+    return f"FRR: {len(state['tenants'])} tenants, {peers} vecinos" + ("" if old != content else " (sin cambios en el fichero)")
+
+
+# ─── Estado en vivo (solo lectura) ───────────────────────────────────────────
+
+def status(s):
+    """JSON con WireGuard, BGP y contadores de aislamiento. No cambia nada."""
+    out = {"version": VERSION, "time": int(time.time()), "wg": {}, "bgp": {}, "nft": {}, "errors": []}
+    iface = "wg0"
+    try:
+        saved = json.load(open(os.path.join(s["STATE_DIR"], "state.json")))
+        iface = saved.get("hub", {}).get("interface", iface) if RE_IFACE.match(str(saved.get("hub", {}).get("interface", ""))) else iface
+    except (OSError, ValueError):
+        pass
+    p = run([s["WG"], "show", iface, "dump"], check=False)
+    if p.returncode == 0:
+        for line in p.stdout.splitlines()[1:]:
+            f = line.split("\t")
+            if len(f) >= 8:
+                out["wg"][f[0]] = {"endpoint": None if f[2] == "(none)" else f[2], "allowed_ips": f[3],
+                                   "latest_handshake": int(f[4]), "rx_bytes": int(f[5]), "tx_bytes": int(f[6])}
+    else:
+        out["errors"].append(f"wg: {(p.stderr or p.stdout).strip()[:300]}")
+    p = run([s["VTYSH"], *vty_args(s), "-c", "show bgp l2vpn evpn summary json"], check=False)
+    try:
+        peers = json.loads(p.stdout or "{}").get("peers", {})
+        for ip, d in peers.items():
+            out["bgp"][ip] = {"state": d.get("state"), "uptime_ms": d.get("peerUptimeMsec"),
+                              "prefixes": d.get("pfxRcd"), "established": d.get("connectionsEstablished"),
+                              "dropped": d.get("connectionsDropped")}
+    except ValueError:
+        out["errors"].append(f"bgp: {(p.stderr or p.stdout).strip()[:300]}")
+    p = run([s["NFT"], "list", "table", "inet", "netkido_iso"], check=False)
+    if p.returncode == 0:
+        for m in re.finditer(r'counter packets (\d+) bytes (\d+).*?comment "netkido: ([^"]+)"', p.stdout):
+            out["nft"][m.group(3)] = {"packets": int(m.group(1)), "bytes": int(m.group(2))}
+    else:
+        out["errors"].append("nft: tabla inet netkido_iso no cargada")
+    print(json.dumps(out))
+    return 0
+
+
+# ─── Principal ───────────────────────────────────────────────────────────────
+
+
+STEPS = [("wg", apply_wg), ("nft", apply_nft), ("frr", apply_frr)]
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Aplica en el hub el estado deseado del portal Netkido")
+    src = ap.add_mutually_exclusive_group()
+    src.add_argument("--from", dest="src", help="leer el estado de un fichero en vez de stdin")
+    src.add_argument("--restore", action="store_true", help="reaplicar el último estado aplicado (arranque)")
+    src.add_argument("--status", action="store_true", help="estado en vivo en JSON (solo lectura)")
+    ap.add_argument("--check", action="store_true", help="solo validar y mostrar lo que se generaría")
+    ap.add_argument("--version", action="version", version=VERSION)
+    args = ap.parse_args()
+
+    s = load_settings(DEFAULTS["CONF_FILE"])
+    if args.status:
+        return status(s)
+    state_file = os.path.join(s["STATE_DIR"], "state.json")
+
+    if args.restore:
+        if not os.path.exists(state_file):
+            log("no hay estado guardado; nada que restaurar")
+            return 0
+        raw = open(state_file).read()
+    elif args.src:
+        raw = open(args.src).read(MAX_INPUT + 1)
+    else:
+        raw = sys.stdin.read(MAX_INPUT + 1)
+    if len(raw) > MAX_INPUT:
+        log("ERROR: entrada demasiado grande")
+        return 2
+    try:
+        original = json.loads(raw)
+        state = validate(original)
+    except (Invalid, json.JSONDecodeError) as e:
+        log(f"ERROR: estado rechazado, no se aplica nada: {e}")
+        return 2
+
+    if args.check:
+        print(render_frr(state, s))
+        print(render_nft(state, s))
+        return 0
+    os.makedirs(s["STATE_DIR"], mode=0o700, exist_ok=True)
+
+    lock = open(s["LOCK_FILE"], "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    skip = {x.strip() for x in s["SKIP"].split(",") if x.strip()}
+    started = time.time()
+    failed = []
+    for name, fn in STEPS:
+        if name in skip:
+            log(f"{name}: omitido (SKIP)")
+            continue
+        try:
+            log(fn(state, s))
+        except Exception as e:  # cada paso es independiente: se intentan todos
+            failed.append(name)
+            log(f"ERROR en {name}: {e}")
+    if not failed:
+        atomic_write(state_file, json.dumps(original, indent=1), 0o600)
+    log(f"{'OK' if not failed else 'CON ERRORES: ' + ', '.join(failed)} en {time.time() - started:.1f} s")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

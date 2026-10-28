@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Sintaxis de Python
+        run: |
+          for f in server/netkido hub/netkido-hub-apply node/netkido-agent.py; do
+            python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$f"
+          done
+          python3 -m py_compile tests/*.py
+      - name: ShellCheck
+        run: |
+          sudo apt-get install -y -qq shellcheck >/dev/null
+          shellcheck -S warning server/install.sh node/install.sh
+      - name: Pruebas
+        run: python3 -m unittest discover -s tests -v
+
+  # Commits firmados (DCO): cada commit del pull request tiene que llevar «Signed-off-by».
+  dco:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Signed-off-by en cada commit
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          bad=0
+          for c in $(git rev-list --no-merges "$BASE..$HEAD"); do
+            if ! git log -1 --format=%B "$c" | grep -q '^Signed-off-by: '; then
+              echo "::error::El commit $(git log -1 --format='%h %s' "$c") no lleva Signed-off-by (git commit -s)"
+              bad=1
+            fi
+          done
+          exit $bad

@@ -1,0 +1,733 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+"""
+netkido — servidor de Netkido (edición abierta): sedes, hub y API de los agentes.
+
+Una sola organización: todas las sedes en la misma red privada (VRF TENANT-1).
+
+  netkido site add <nombre> <LAN> [--ports eth1,eth2] [--no-dhcp]   alta + comando de instalación
+  netkido site list | show <sede> | link <sede>
+  netkido site lan <sede> <LAN> | ports <sede> <eth1,eth2|-> | dhcp <sede> on|off
+  netkido site disable | enable | remove <sede>
+  netkido status | apply
+  netkido serve                     API de los agentes e instalador (servicio netkido)
+  netkido init --domain <dominio>   lo ejecuta server/install.sh
+
+Estado: /var/lib/netkido/state.json. El hub lo aplica netkido-hub-apply (WireGuard, FRR, nftables).
+Solo la biblioteca estándar de Python.
+"""
+import argparse
+import base64
+import fcntl
+import hashlib
+import hmac
+import http.server
+import ipaddress
+import json
+import os
+import re
+import secrets
+import socketserver
+import ssl
+import subprocess
+import sys
+import threading
+import time
+import unicodedata
+import urllib.parse
+
+VERSION = "1.0.0"
+
+STATE_DIR = os.environ.get("NETKIDO_STATE_DIR", "/var/lib/netkido")
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
+LIB_DIR = os.environ.get("NETKIDO_LIB_DIR", "/usr/local/lib/netkido")
+HUB_APPLY = os.environ.get("NETKIDO_HUB_APPLY", "/usr/local/sbin/netkido-hub-apply")
+WG_KEY_FILE = "/etc/netkido/wg0.key"
+
+HUB = {"interface": "wg0", "ip": "100.64.0.1", "underlay": "100.64.0.0/16", "asn": 65000}
+NET_ID = 1                      # una sola organización
+TOKEN_TTL = 24 * 3600
+CLOCK_SKEW = 300
+NONCE_TTL = 900
+HEARTBEAT_MIN = 10
+OFFLINE_AFTER = 180
+MAX_BODY = 1024 * 1024
+
+RE_KEY = re.compile(r"^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$")
+RE_IFACE = re.compile(r"^[a-zA-Z][a-zA-Z0-9._-]{0,14}$")
+RE_VERSION = re.compile(r"^\d{1,3}\.\d{1,3}\.\d{1,3}$")
+RE_TOKEN = re.compile(r"^[A-Za-z0-9]{40}$")
+
+
+class Error(Exception):
+    def __init__(self, message, status=422):
+        super().__init__(message)
+        self.status = status
+
+
+def log(msg):
+    print(f"[netkido] {msg}", file=sys.stderr, flush=True)
+
+
+# ─── Estado ──────────────────────────────────────────────────────────────────
+
+class State:
+    """state.json con bloqueo de fichero: lo comparten el servicio y el comando."""
+
+    def __init__(self, path=STATE_FILE):
+        self.path = path
+
+    def _lock(self):
+        path = self.path + ".lock"
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o660)
+        try:   # lo comparten root (comando) y netkido (servicio): mismo dueño que el directorio
+            d = os.stat(os.path.dirname(path))
+            if os.geteuid() == 0:
+                os.fchown(fd, d.st_uid, d.st_gid)
+        except OSError:
+            pass
+        f = os.fdopen(fd, "r+")
+        fcntl.flock(f, fcntl.LOCK_EX)
+        return f
+
+    def read(self):
+        with open(self.path) as f:
+            return json.load(f)
+
+    def update(self, fn):
+        """Lee, aplica fn(state) y guarda de forma atómica. Devuelve lo que devuelva fn."""
+        lock = self._lock()
+        try:
+            st = self.read()
+            result = fn(st)
+            tmp = self.path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(st, f, indent=1, sort_keys=True)
+            os.chmod(tmp, 0o600)
+            try:
+                s = os.stat(self.path)
+                os.chown(tmp, s.st_uid, s.st_gid)
+            except OSError:
+                pass
+            os.replace(tmp, self.path)
+            return result
+        finally:
+            lock.close()
+
+
+def new_state(domain, endpoint, hub_public_key, dns):
+    return {"schema": 1, "domain": domain, "endpoint": endpoint, "hub_public_key": hub_public_key,
+            "bgp_password": secrets.token_hex(16), "dns": dns, "dhcp_lease": "12h", "sites": {}}
+
+
+ALNUM = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+
+def node_id():
+    return "".join(secrets.choice(ALNUM[:26] + ALNUM[52:]) for _ in range(26))
+
+
+def slugify(name):
+    s = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode().lower()
+    return re.sub(r"[^a-z0-9]+", "-", s).strip("-")[:40] or "sede"
+
+
+def find_site(st, ref):
+    ref = ref.strip()
+    for s in st["sites"].values():
+        if ref in (s["id"], s["slug"], s["name"]):
+            return s
+    raise Error(f"no existe la sede «{ref}»", 404)
+
+
+def parse_lan(cidr, st, exclude=None):
+    """«192.168.10.1/24»: IP del router de la sede y prefijo. Privada, sin solapes."""
+    try:
+        iface = ipaddress.IPv4Interface(cidr)
+    except ValueError:
+        raise Error(f"LAN no válida: {cidr} (ejemplo: 192.168.10.1/24)")
+    net = iface.network
+    if not net.is_private or not (16 <= net.prefixlen <= 30):
+        raise Error("la LAN tiene que ser privada, entre /16 y /30")
+    if iface.ip in (net.network_address, net.broadcast_address):
+        raise Error("la IP del router no puede ser la de red ni la de difusión")
+    if net.overlaps(ipaddress.IPv4Network(HUB["underlay"])):
+        raise Error(f"la LAN se solapa con la red de túneles {HUB['underlay']}")
+    for s in st["sites"].values():
+        if s["id"] != exclude and ipaddress.IPv4Interface(s["lan_cidr"]).network.overlaps(net):
+            raise Error(f"la LAN se solapa con la de la sede «{s['name']}»")
+    return f"{iface.ip}/{net.prefixlen}"
+
+
+def parse_ports(value):
+    ports = [p.strip() for p in (value or "").split(",") if p.strip() and p.strip() != "-"]
+    for p in ports:
+        if not RE_IFACE.match(p):
+            raise Error(f"interfaz no válida: {p}")
+    return sorted(set(ports))
+
+
+def next_wg_ip(st):
+    used = {s["wg_ip"] for s in st["sites"].values()} | {HUB["ip"]}
+    for ip in ipaddress.IPv4Network(HUB["underlay"]).hosts():
+        if str(ip) not in used:
+            return str(ip)
+    raise Error("no quedan IP de túnel")
+
+
+def new_token(site):
+    token = "".join(secrets.choice(ALNUM) for _ in range(40))
+    site["token"] = {"sha256": hashlib.sha256(token.encode()).hexdigest(), "expires": int(time.time()) + TOKEN_TTL}
+    return token
+
+
+def token_site(st, token):
+    if not RE_TOKEN.match(token or ""):
+        return None
+    h = hashlib.sha256(token.encode()).hexdigest()
+    for s in st["sites"].values():
+        t = s.get("token")
+        if t and hmac.compare_digest(t["sha256"], h) and t["expires"] > time.time() and s["status"] != "disabled":
+            return s
+    return None
+
+
+# ─── Configuración de la sede y estado del hub ───────────────────────────────
+
+def dhcp_range(lan_cidr, enabled):
+    iface = ipaddress.IPv4Interface(lan_cidr)
+    net, gw = iface.network, int(iface.ip)
+    first, last = int(net.network_address), int(net.broadcast_address)
+    start, end = first + (last - first + 1) // 2, last - 1
+    if start <= gw <= end:
+        if gw == end:
+            end -= 1
+        else:
+            start = max(start, gw + 1)
+    ok = enabled and start <= end
+    return ok, (str(ipaddress.IPv4Address(start)) if ok else None), (str(ipaddress.IPv4Address(end)) if ok else None)
+
+
+def node_config(st, site):
+    ok, start, end = dhcp_range(site["lan_cidr"], site.get("dhcp", True))
+    return {
+        "schema": 1,
+        "version": site["config_version"],
+        "node": {"id": site["id"], "name": site["name"], "hostname": ("nk-" + site["slug"])[:63].rstrip("-")},
+        "wireguard": {
+            "interface": "nk0", "address": site["wg_ip"], "mtu": 1420,
+            "hub": {"endpoint": st["endpoint"], "public_key": st["hub_public_key"], "ip": HUB["ip"],
+                    "allowed_ips": HUB["underlay"], "keepalive": 25},
+        },
+        "overlay": {"vrf": f"TENANT-{NET_ID}", "table": 1000 + NET_ID, "l3vni": 100000 + NET_ID, "vxlan_mtu": 1370,
+                    "bridge": f"nkbr{NET_ID}", "vxlan": f"nkvx{NET_ID}"},
+        "lan": {"bridge": "nklan", "address": site["lan_cidr"], "interfaces": site.get("lan_interfaces", []),
+                "dhcp": {"enabled": ok, "start": start, "end": end, "lease": st.get("dhcp_lease", "12h"), "dns": st.get("dns", [])}},
+        "bgp": {"asn": HUB["asn"], "router_id": site["wg_ip"], "neighbor": HUB["ip"],
+                "password": st["bgp_password"] if site.get("bgp_md5", True) else None},
+    }
+
+
+def hub_state(st):
+    nodes = [{"id": s["id"], "wg_ip": s["wg_ip"], "wg_pubkey": s["wg_pubkey"],
+              "lan": str(ipaddress.IPv4Interface(s["lan_cidr"]).network), "bgp_md5": s.get("bgp_md5", True)}
+             for s in sorted(st["sites"].values(), key=lambda s: ipaddress.IPv4Address(s["wg_ip"]))
+             if s["status"] == "active" and s.get("wg_pubkey")]
+    tenants = [{"net_id": NET_ID, "bgp_password": st["bgp_password"], "nodes": nodes}] if nodes else []
+    return {"schema": 1, "hub": dict(HUB), "tenants": tenants}
+
+
+def apply_hub(st):
+    cmd = [HUB_APPLY] if os.geteuid() == 0 else ["sudo", "-n", HUB_APPLY]
+    p = subprocess.run(cmd, input=json.dumps(hub_state(st)), capture_output=True, text=True, timeout=120)
+    if p.returncode != 0:
+        log(f"netkido-hub-apply terminó con {p.returncode}: {(p.stderr or p.stdout).strip()[-800:]}")
+    return p.returncode == 0
+
+
+# ─── API de los agentes e instalador ─────────────────────────────────────────
+
+class Api:
+    def __init__(self, state, base_url):
+        self.state = state
+        self.base_url = base_url.rstrip("/")
+        self.nonces = {}
+        self.hits = {}
+        self.lock = threading.Lock()
+
+    # -- utilidades
+    def limited(self, key, limit, window=60):
+        now = time.time()
+        with self.lock:
+            q = [t for t in self.hits.get(key, []) if t > now - window]
+            q.append(now)
+            self.hits[key] = q
+            if len(self.hits) > 10000:
+                self.hits = {k: v for k, v in self.hits.items() if v and v[-1] > now - window}
+            return len(q) > limit
+
+    def agent_file(self):
+        path = os.path.join(LIB_DIR, "netkido-agent.py")
+        with open(path, "rb") as f:
+            data = f.read()
+        m = re.search(rb'^AGENT_VERSION = "([0-9.]+)"', data, re.M)
+        return data, hashlib.sha256(data).hexdigest(), (m.group(1).decode() if m else "0.0.0")
+
+    def messages(self, lang):
+        with open(os.path.join(LIB_DIR, "messages.json")) as f:
+            msgs = json.load(f)
+        return msgs.get(lang) or msgs["es"]
+
+    @staticmethod
+    def quote(s):
+        return "'" + s.replace("'", "'\\''") + "'"
+
+    # -- instalador
+    def install_script(self, token, lang):
+        st = self.state.read()
+        site = token_site(st, token)
+        msgs = self.messages(lang)
+        if not site:
+            return f"echo {self.quote(msgs['INVALID_LINK'])} >&2\nexit 1\n"
+        with open(os.path.join(LIB_DIR, "install.sh")) as f:
+            tpl = f.read()
+        block = "\n".join(f"M_{k}={self.quote(v)}" for k, v in msgs.items())
+        for k, v in {"@@PORTAL_URL@@": self.base_url, "@@INSTALL_TOKEN@@": token,
+                     "@@SITE_NAME@@": re.sub(r"[^\w .-]", "", site["name"]), "@@LANG@@": lang, "@@MESSAGES@@": block}.items():
+            tpl = tpl.replace(k, v)
+        return tpl
+
+    def enroll(self, data, ip):
+        key = str(data.get("wg_public_key", ""))
+        if not RE_KEY.match(key) or len(base64.b64decode(key)) != 32:
+            raise Error("clave pública de WireGuard no válida")
+        if key == self.state.read().get("hub_public_key"):
+            raise Error("esa clave ya la usa otra sede")
+        secret = secrets.token_urlsafe(36)
+
+        def fn(st):
+            site = token_site(st, str(data.get("token", "")))
+            if not site:
+                raise Error("enlace de instalación no válido, caducado o ya usado")
+            if any(s["wg_pubkey"] == key and s["id"] != site["id"] for s in st["sites"].values()):
+                raise Error("esa clave ya la usa otra sede")
+            site.update({"wg_pubkey": key, "secret": secret, "status": "active", "token": None,
+                         "installed_at": int(time.time()), "applied_version": None, "last_error": None})
+            site["config_version"] += 1
+            self._identity(site, data, ip)
+            return site["id"], node_config(st, site)
+
+        nid, cfg = self.state.update(fn)
+        apply_hub(self.state.read())
+        log(f"sede {nid} inscrita desde {ip}")
+        return {"node_id": nid, "secret": secret, "config": cfg}
+
+    @staticmethod
+    def _identity(site, data, ip):
+        if isinstance(data.get("hostname"), str):
+            site["hostname"] = re.sub(r"[^A-Za-z0-9._-]", "", data["hostname"])[:64]
+        if isinstance(data.get("os"), str):
+            site["os"] = re.sub(r"[^\w ._/()+:·-]", "", data["os"])[:128]
+        if RE_VERSION.match(str(data.get("agent_version", ""))):
+            site["agent_version"] = data["agent_version"]
+        site["public_ip"] = ip
+
+    # -- peticiones firmadas
+    def authenticate(self, method, path, headers, body):
+        nid = headers.get("X-Netkido-Node", "")
+        ts, nonce, sig = headers.get("X-Netkido-Timestamp", ""), headers.get("X-Netkido-Nonce", ""), headers.get("X-Netkido-Signature", "")
+        if not (ts.isdigit() and abs(time.time() - int(ts)) <= CLOCK_SKEW and 16 <= len(nonce) <= 64 and re.fullmatch(r"[0-9a-f]{64}", sig)):
+            raise Error("firma no válida", 401)
+        site = self.state.read()["sites"].get(nid)
+        if not site or not site.get("secret"):
+            raise Error("firma no válida", 401)
+        payload = "\n".join(["NK1", method, path, ts, nonce, hashlib.sha256(body).hexdigest()])
+        good = hmac.new(site["secret"].encode(), payload.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(good, sig):
+            raise Error("firma no válida", 401)
+        with self.lock:
+            now = time.time()
+            if (nid, nonce) in self.nonces:
+                raise Error("petición repetida", 401)
+            self.nonces[(nid, nonce)] = now
+            if len(self.nonces) > 50000:
+                self.nonces = {k: t for k, t in self.nonces.items() if t > now - NONCE_TTL}
+        if site["status"] == "disabled":
+            raise Error("Sede desactivada", 403)
+        return site
+
+    def heartbeat(self, site, data, ip):
+        if self.limited(("hb", site["id"]), 1, HEARTBEAT_MIN) and data.get("agent_version") == site.get("agent_version"):
+            raise Error("demasiadas peticiones", 429)
+        _data, sha, bundled = self.agent_file()
+        changed = {}
+
+        def fn(st):
+            s = st["sites"][site["id"]]
+            self._identity(s, data, ip)
+            s["last_seen"] = int(time.time())
+            v = data.get("applied_config_version")
+            if isinstance(v, int) and 0 <= v <= s["config_version"]:
+                s["applied_version"] = v
+            err = data.get("apply_error")
+            s["last_error"] = err[:2000] if isinstance(err, str) and err else None
+            m = data.get("metrics") if isinstance(data.get("metrics"), dict) else {}
+            lat = m.get("latency_ms")
+            s["latency_ms"] = lat if isinstance(lat, (int, float)) and 0 <= lat < 100000 else None
+            if isinstance(data.get("bgp_md5"), bool) and data["bgp_md5"] != s.get("bgp_md5", True):
+                s["bgp_md5"] = data["bgp_md5"]
+                s["config_version"] += 1
+                changed["md5"] = True
+            return s["config_version"], s.get("agent_version")
+
+        version, agent = self.state.update(fn)
+        if changed:
+            apply_hub(self.state.read())
+        r = {"ok": True, "config_version": version, "pending_jobs": 0, "server_time": int(time.time())}
+        if agent and tuple(map(int, agent.split("."))) < tuple(map(int, bundled.split("."))):
+            r["agent_update"] = {"version": bundled, "sha256": sha, "url": "/api/agent/v1/agent"}
+        return r
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    api: Api = None
+    server_version = "netkido"
+    sys_version = ""
+
+    def log_message(self, fmt, *args):
+        if os.environ.get("NETKIDO_ACCESS_LOG"):
+            log(f"{self.client_address[0]} {fmt % args}")
+
+    def ip(self):
+        return self.client_address[0]
+
+    def send(self, status, body, ctype="application/json", headers=None):
+        data = body if isinstance(body, bytes) else (json.dumps(body) if ctype == "application/json" else body).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", ctype + ("; charset=utf-8" if ctype.startswith("text/") else ""))
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        if n > MAX_BODY:
+            raise Error("petición demasiado grande", 413)
+        return self.rfile.read(n) if n else b""
+
+    def json_body(self, raw):
+        try:
+            data = json.loads(raw or b"{}")
+        except ValueError:
+            raise Error("JSON no válido", 400)
+        if not isinstance(data, dict):
+            raise Error("JSON no válido", 400)
+        return data
+
+    def handle_one(self, method):
+        path = urllib.parse.urlsplit(self.path).path
+        raw = self.body() if method == "POST" else b""
+        m = re.fullmatch(r"/install/([A-Za-z0-9]{1,64})(/agent)?", path)
+        if method == "GET" and m:
+            if self.api.limited(("install", self.ip()), 30):
+                raise Error("demasiadas peticiones", 429)
+            if m.group(2):
+                if not token_site(self.api.state.read(), m.group(1)):
+                    raise Error("no encontrado", 404)
+                data, sha, _v = self.api.agent_file()
+                return self.send(200, data, "text/x-python", {"X-Netkido-Agent-Sha256": sha})
+            q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            lang = "en" if q.get("lang", [""])[0] == "en" else "es"
+            return self.send(200, self.api.install_script(m.group(1), lang), "text/x-shellscript")
+        if path == "/api/agent/v1/enroll" and method == "POST":
+            if self.api.limited(("enroll", self.ip()), 10):
+                raise Error("demasiadas peticiones", 429)
+            return self.send(200, self.api.enroll(self.json_body(raw), self.ip()))
+        if path.startswith("/api/agent/v1/"):
+            site = self.api.authenticate(method, path, self.headers, raw)
+            route = path[len("/api/agent/v1/"):]
+            if route == "heartbeat" and method == "POST":
+                return self.send(200, self.api.heartbeat(site, self.json_body(raw), self.ip()))
+            if route == "config" and method == "GET":
+                st = self.api.state.read()
+                return self.send(200, node_config(st, st["sites"][site["id"]]))
+            if route == "jobs" and method == "GET":
+                return self.send(200, {"jobs": []})
+            if route == "events" and method == "POST":
+                return self.send(200, {"ok": True})
+            if route == "agent" and method == "GET":
+                data, sha, _v = self.api.agent_file()
+                return self.send(200, data, "text/x-python", {"X-Netkido-Agent-Sha256": sha})
+        if path in ("/", "/up"):
+            return self.send(200, {"ok": True, "service": "netkido", "version": VERSION})
+        raise Error("no encontrado", 404)
+
+    def dispatch(self, method):
+        try:
+            self.handle_one(method)
+        except Error as e:
+            self.send(e.status, {"error": "error", "message": str(e)})
+        except Exception as e:  # noqa: BLE001
+            log(f"error en {method} {self.path}: {e!r}")
+            self.send(500, {"error": "server_error", "message": "error interno"})
+
+    def do_GET(self):
+        self.dispatch("GET")
+
+    def do_POST(self):
+        self.dispatch("POST")
+
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def serve(args):
+    st = State().read()
+    tls = not args.insecure_http
+    base = args.base_url or (f"https://{st['domain']}" if tls else f"http://{st['domain']}:{args.port}")
+    Handler.api = Api(State(), base)
+    httpd = Server((args.listen, args.port), Handler)
+    if tls:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.load_cert_chain(args.cert, args.key)
+        httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+    log(f"netkido {VERSION} escuchando en {args.listen}:{args.port} ({'https' if tls else 'http, solo pruebas'}) · {base}")
+    httpd.serve_forever()
+
+
+# ─── Comando ─────────────────────────────────────────────────────────────────
+
+def commands(st, site, token):
+    base = f"https://{st['domain']}"
+    return [f"curl -fsSL {base}/install/{token} | sudo bash",
+            f"(en inglés / in English: curl -fsSL {base}/install/{token}?lang=en | sudo bash)"]
+
+
+def print_link(st, site, token):
+    print(f"\nSede «{site['name']}» · LAN {site['lan_cidr']} · túnel {site['wg_ip']}")
+    print("Instálala ejecutando como root en el equipo de la sede (Debian 12/13, Ubuntu 22.04/24.04, Armbian,")
+    print("Raspberry Pi OS). El enlace es de un solo uso y caduca en 24 horas:\n")
+    for c in commands(st, site, token):
+        print("  " + c)
+    print()
+
+
+def site_state(s):
+    if s["status"] == "disabled":
+        return "desactivada"
+    if s["status"] == "pending":
+        return "pendiente de instalar"
+    if not s.get("last_seen") or time.time() - s["last_seen"] > OFFLINE_AFTER:
+        return "sin conexión"
+    if s.get("last_error"):
+        return "error al aplicar"
+    return "conectada" if s.get("applied_version") == s["config_version"] else "aplicando"
+
+
+def need_root():
+    if os.geteuid() != 0:
+        raise Error("ejecútalo como root (sudo netkido …)", 1)
+
+
+def change(fn, reapply=True):
+    st = State()
+    result = st.update(fn)
+    if reapply and not apply_hub(st.read()):
+        print("AVISO: el hub no se ha podido aplicar del todo; revisa «journalctl -t netkido-hub-apply» "
+              "o ejecuta «netkido apply».", file=sys.stderr)
+    return result
+
+
+def cmd_site(args):
+    need_root()
+    a = args.action
+    if a == "list":
+        st = State().read()
+        rows = sorted(st["sites"].values(), key=lambda s: ipaddress.IPv4Address(s["wg_ip"]))
+        if not rows:
+            print("No hay sedes. Da de alta la primera:  netkido site add <nombre> <LAN>")
+            return 0
+        print(f"{'SEDE':<20} {'LAN':<18} {'TÚNEL':<14} {'ESTADO':<22} {'AGENTE':<8} PUERTOS LAN")
+        for s in rows:
+            print(f"{s['name'][:20]:<20} {s['lan_cidr']:<18} {s['wg_ip']:<14} {site_state(s):<22} "
+                  f"{s.get('agent_version') or '—':<8} {','.join(s.get('lan_interfaces') or []) or '—'}")
+        return 0
+    if a == "add":
+        name = " ".join(args.args[:-1]).strip() if len(args.args) >= 2 else ""
+        if not name:
+            raise Error("uso: netkido site add <nombre> <LAN> [--ports eth1,eth2] [--no-dhcp]", 2)
+
+        def fn(st):
+            slug = slugify(name)
+            if any(s["slug"] == slug for s in st["sites"].values()):
+                raise Error(f"ya hay una sede «{name}»")
+            site = {"id": node_id(), "name": name[:64], "slug": slug, "lan_cidr": parse_lan(args.args[-1], st),
+                    "lan_interfaces": parse_ports(args.ports), "dhcp": not args.no_dhcp, "wg_ip": next_wg_ip(st),
+                    "status": "pending", "wg_pubkey": None, "secret": None, "config_version": 1, "bgp_md5": True,
+                    "created_at": int(time.time())}
+            token = new_token(site)
+            st["sites"][site["id"]] = site
+            return st, site, token
+
+        st, site, token = change(fn, reapply=False)
+        print_link(st, site, token)
+        return 0
+    if not args.args:
+        raise Error(f"uso: netkido site {a} <sede>", 2)
+    ref = args.args[0]
+    if a == "show":
+        st = State().read()
+        s = find_site(st, ref)
+        info = {k: v for k, v in s.items() if k not in ("secret", "token")}
+        info["state"] = site_state(s)
+        print(json.dumps(info, indent=2, ensure_ascii=False))
+        return 0
+    if a == "link":
+        def fn(st):
+            s = find_site(st, ref)
+            if s["status"] == "disabled":
+                raise Error("la sede está desactivada: actívala antes (netkido site enable)")
+            return st, s, new_token(s)
+        st, s, token = change(fn, reapply=False)
+        print_link(st, s, token)
+        if s.get("wg_pubkey"):
+            print("Al reinstalar con este enlace, el equipo recibe claves nuevas y las anteriores dejan de valer.\n")
+        return 0
+
+    def edit(mutate, reapply=True, msg=None):
+        def fn(st):
+            s = find_site(st, ref)
+            mutate(st, s)
+            s["config_version"] += 1
+            return s
+        s = change(fn, reapply=reapply)
+        print(msg or f"Hecho. La sede «{s['name']}» recibe la configuración nueva en menos de un minuto.")
+
+    if a == "lan":
+        if len(args.args) < 2:
+            raise Error("uso: netkido site lan <sede> <LAN>", 2)
+        edit(lambda st, s: s.update(lan_cidr=parse_lan(args.args[1], st, exclude=s["id"])))
+    elif a == "ports":
+        if len(args.args) < 2:
+            raise Error("uso: netkido site ports <sede> eth1,eth2   («-» para ninguno)", 2)
+        edit(lambda st, s: s.update(lan_interfaces=parse_ports(args.args[1])), reapply=False)
+    elif a == "dhcp":
+        if len(args.args) < 2 or args.args[1] not in ("on", "off"):
+            raise Error("uso: netkido site dhcp <sede> on|off", 2)
+        edit(lambda st, s: s.update(dhcp=args.args[1] == "on"), reapply=False)
+    elif a == "disable":
+        edit(lambda st, s: s.update(status="disabled"), msg="Sede desactivada: sale de la red hasta que la actives.")
+    elif a == "enable":
+        def en(st, s):
+            if s["status"] != "disabled":
+                raise Error("la sede no está desactivada")
+            s["status"] = "active" if s.get("wg_pubkey") else "pending"
+        edit(en, msg="Sede activada.")
+    elif a == "remove":
+        def fn(st):
+            s = find_site(st, ref)
+            del st["sites"][s["id"]]
+            return s
+        s = change(fn)
+        print(f"Sede «{s['name']}» borrada. Su equipo deja de estar conectado (desinstálalo allí si quieres).")
+    else:
+        raise Error(f"acción desconocida: {a}", 2)
+    return 0
+
+
+def cmd_status(_args):
+    need_root()
+    st = State().read()
+    sites = list(st["sites"].values())
+    print(f"Netkido {VERSION} · {st['domain']} · hub {HUB['ip']} · WireGuard {st['endpoint']}")
+    print(f"Sedes: {len(sites)} · conectadas {sum(1 for s in sites if site_state(s) == 'conectada')} · "
+          f"pendientes {sum(1 for s in sites if s['status'] == 'pending')} · desactivadas {sum(1 for s in sites if s['status'] == 'disabled')}")
+    p = subprocess.run([HUB_APPLY, "--status"], capture_output=True, text=True, timeout=60)
+    if p.returncode == 0:
+        try:
+            live = json.loads(p.stdout)
+            bgp = live.get("bgp") or {}
+            print(f"Hub: {len(live.get('wg') or {})} túneles WireGuard · sesiones BGP establecidas: "
+                  f"{sum(1 for v in bgp.values() if isinstance(v, dict) and v.get('state') == 'Established')}")
+        except ValueError:
+            pass
+    return 0
+
+
+def cmd_apply(_args):
+    need_root()
+    ok = apply_hub(State().read())
+    print("Hub aplicado." if ok else "El hub no se ha podido aplicar del todo (mira los mensajes anteriores).")
+    return 0 if ok else 1
+
+
+def cmd_init(args):
+    need_root()
+    os.makedirs(STATE_DIR, mode=0o750, exist_ok=True)
+    with open(WG_KEY_FILE) as f:
+        private = f.read()
+    pub = subprocess.run(["wg", "pubkey"], input=private, capture_output=True, text=True, check=True).stdout.strip()
+    endpoint = f"{args.domain}:{args.wg_port}"
+    dns = [d.strip() for d in args.dns.split(",") if d.strip()]
+    for d in dns:
+        ipaddress.IPv4Address(d)
+    if os.path.exists(STATE_FILE):
+        def fn(st):
+            st.update(domain=args.domain, endpoint=endpoint, hub_public_key=pub, dns=dns)
+            for s in st["sites"].values():
+                s["config_version"] += 1      # por si cambió el dominio, el puerto o el DNS
+        State().update(fn)
+        print("Estado existente actualizado.")
+    else:
+        with open(STATE_FILE, "w") as f:
+            json.dump(new_state(args.domain, endpoint, pub, dns), f, indent=1, sort_keys=True)
+        os.chmod(STATE_FILE, 0o600)
+        print(f"Estado creado en {STATE_FILE}.")
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="netkido", description="Netkido (edición abierta): sedes, hub y API de los agentes")
+    ap.add_argument("--version", action="version", version=VERSION)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("site", help="sedes")
+    p.add_argument("action", choices=["list", "add", "show", "link", "lan", "ports", "dhcp", "disable", "enable", "remove"])
+    p.add_argument("args", nargs="*")
+    p.add_argument("--ports", default="", help="puertos LAN, separados por comas (add)")
+    p.add_argument("--no-dhcp", action="store_true", help="sin servidor DHCP en la LAN (add)")
+    p.set_defaults(fn=cmd_site)
+    sub.add_parser("status", help="resumen de sedes y del hub").set_defaults(fn=cmd_status)
+    sub.add_parser("apply", help="volver a aplicar el hub").set_defaults(fn=cmd_apply)
+    p = sub.add_parser("init", help="crea o actualiza el estado (lo usa server/install.sh)")
+    p.add_argument("--domain", required=True)
+    p.add_argument("--wg-port", type=int, default=51820)
+    p.add_argument("--dns", default="1.1.1.1,9.9.9.9")
+    p.set_defaults(fn=cmd_init)
+    p = sub.add_parser("serve", help="API de los agentes e instalador (servicio netkido)")
+    p.add_argument("--listen", default="0.0.0.0")
+    p.add_argument("--port", type=int, default=443)
+    p.add_argument("--cert", default="/etc/netkido/tls/fullchain.pem")
+    p.add_argument("--key", default="/etc/netkido/tls/privkey.pem")
+    p.add_argument("--base-url", default="", help="URL pública (por defecto https://<dominio>)")
+    p.add_argument("--insecure-http", action="store_true", help="sin TLS: solo para pruebas")
+    p.set_defaults(fn=serve)
+    args = ap.parse_args(argv)
+    try:
+        return args.fn(args) or 0
+    except Error as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return e.status if e.status < 100 else 1
+    except FileNotFoundError as e:
+        print(f"ERROR: {e.filename} no existe (¿está instalado el servidor? server/install.sh)", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
